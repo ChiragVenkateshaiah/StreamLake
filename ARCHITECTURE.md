@@ -155,7 +155,7 @@ All open source + cloud
 
 ### 9. Repository Structure
 ```
-streaming-lakehouse/
+StreamLake/
  ├── api/
  ├── kafka/
  │   ├── producer/
