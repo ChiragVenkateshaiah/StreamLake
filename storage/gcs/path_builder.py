@@ -12,6 +12,6 @@ def build_raw_path(
     return(
         f"gs://{bucket}/raw/"
         f"dataset={dataset}/"
-        f"ingestion_date={ingestion_date}"
+        f"ingestion_date={ingestion_date}/"
         f"part-{partition}-{offset}.json"
     )

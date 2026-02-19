@@ -8,7 +8,7 @@ def get_kafka_producer_config() -> Dict[str, object]:
     """
 
     return {
-        "bootstrap.servers": os.getenv("KAFKA_BOOTSTRAP_SERVICES", "127.0.0.1:9092"),
+        "bootstrap.servers": os.getenv("KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092"),
 
         # Strong durability
         "acks": "all",
