@@ -10,10 +10,13 @@ def handle_record(msg, dataset: str):
     """
     key = msg.key().decode("utf-8") if msg.key() else None
     value = json.loads(msg.value().decode("utf-8"))
-    headers = dict(msg.headers() or [])
+    headers = {
+        k: v.decode("utf-8") if isinstance(v, bytes) else v
+        for k, v in (msg.headers() or [])
+    }
 
     gcs_path = build_raw_path(
-        bucket="streamlake-bucket",
+        bucket="streamlake-raw",
         dataset=dataset,
         partition=msg.partition(),
         offset=msg.offset()
