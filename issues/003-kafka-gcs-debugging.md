@@ -133,3 +133,228 @@ This dict comprehension decodes bytes values to UTF-8 strings while preserving a
 
 ---
 
+## Issue 4: GCS 403 Forbidden - Authentication Scopes
+
+### Symptom
+Consumer successfully deserialized messages and constructed GCS paths, but GCS write operations failed with HTTP 403:
+
+```bash
+
+google.api_core.exceptions.Forbidden: 403 POST
+'Provided scope(s) are not authorized'
+```
+
+### Root Cause Analysis
+#### Multi-layered authentication issue:
+
+#### Layer 1: Missing OAuth Scopes
+
+gcloud auth application-default login by default only grants read-only scopes. Write operations require explicit cloud-platform scope.
+
+```bash
+# Default (insufficient):
+gcloud auth application-default login
+# Grants: https://www.googleapis.com/auth/userinfo.email (read-only)
+
+# Required:
+gcloud auth application-default login --scopes=https://www.googleapis.com/auth/cloud-platform
+```
+
+#### Layer 2: Per-Machine Credentials
+
+Credentials authenticated on Windows machine (where gsutil commands were tested) were not available on the Linux VM where the consumer was running. Each machine maintains separate credential stores.
+
+**Key Insight**: Just because 'gsutil ls' works on your laptop doesn't mean your deployed service can access GCS. Always verify credentials on the actual execution environment.
+
+#### Layer 3: Bucket-Level IAM Permissions
+
+Even with correct OAuth scopes, the authenticated user account lacked storage.objects.create permission on the bucket. This required explicit IAM binding.
+
+### Complete Solution
+
+#### Step 1: Re-authenticate with correct scopes on Linux VM
+```bash
+gcloud auth application-default revoke
+gcloud auth application-default login --scopes=https://www.googleapis.com/auth/cloud-platform
+```
+#### Step 2: Grant IAM permissions
+```bash
+gsutil iam ch user:chiragvenkateshaiah95@gmail.com:objectAdmin gs://streamlake-raw
+```
+
+#### Step 3: Verify write access
+```python
+python3 -c "
+from google.cloud import storage
+client = storage.Client()
+bucket = client.bucket('streamlake-raw')
+blob = bucket.blob('test.txt')
+blob.upload_from_string('test')
+print('✓ Write successful')
+```
+### Prevention for Future
+
+- Use service account keys (not user credentials) for deployed services
+- Document required OAuth scopes in deployment runbooks
+- Test GCS access from actual execution environment before deploying consumers
+- Use Workload Identity (GKE) or IAM roles (EC2) instead of credential files
+- Add health check endpoint that validates cloud storage access on startup
+
+---
+
+## Issue 5: Kafka Crash Loops - Memory Pressure
+
+### Symptom
+
+After fixing all previous issues, Kafka container entered a persistent crash loop pattern:
+
+- Container starts successfully
+- Runs for 10-15 seconds
+- Docker shows 'Restarting' status
+- Health status stuck at 'health: starting', never reaches 'healthy'
+
+### Root Cause Analysis
+#### Dual failure mode: Memory exhaustion + slow healthcheck timeout
+
+### Root Cause 1: Memory Pressure
+
+Resource analysis revealed:
+
+```bash
+VM Total Memory: 3.6 GB
+VM Free Memory: 222 MB
+Kafka Container Limit: 512 MB
+Kafka Actual Usage: 445 MB (87% of limit)
+```
+Kafka JVM was hitting memory ceiling during initialization. When healthcheck command ran (Kafka-topics --list), it spawned  a new JVM process that exceeded the 512MB container limit, triggering OOM kill.
+
+### Root Cause 2: Slow Healthcheck
+
+Original healthcheck configuration:
+
+```bash
+test: kafka-topics --bootstrap-server localhost:9092 --list
+timeout: 10s
+start_period: 30s
+```
+The kafka-topics command was taking longer than 10 seconds to execute due to memory pressure, causing Docker to mark the container unhealthy and restart it.
+
+
+### Solution
+
+#### Multi-pronged fix addressing both memory and healthcheck:
+
+#### Fix 1: Increase Container Memory Limits
+
+```bash
+deploy:
+  resources:
+    limits:
+      memory: 768M  # Increased from 512M
+    reservations:
+      memory: 384M  # Increased from 256M
+```
+#### Fix 2: Cap JVM Heap Size
+
+```bash
+environment:
+  KAFKA_HEAP_OPTS: '-Xmx256M -Xms256M'
+```
+This ensures Kafka JVM doesn't grow beyond 256MB, leaving headroom for off-heap memory and healthcheck processes.
+
+#### Fix 3: Faster Healthcheck Command
+
+```bash
+test: kafka-broker-api-versions --bootstrap-server localhost:9092 | head -n 1
+interval: 20s  # Increased from 10s
+timeout: 10s
+retries: 10  # Increased from 5
+start_period: 90s  # Increased from 30s
+```
+kafka-broker-api-versions is significantly faster than kafka-topics --list because it only fetches API version metadata, not full topic listings.
+
+### Why This Fix Works
+
+- 768MB limit provides breathing room for JVM (256M) + off-heap + healthcheck
+- Fixed heap size prevents unbounded memory growth
+- Faster healthcheck command reduces memory spike during probe
+- Extended start_period (90s) gives KRaft full initialization time
+
+### Memory Breakdown for JVM Services
+```
+| Component	           |     Memory	|        Purpose                | 
+| JVM Heap (-Xmx)      | 	256 MB	| Objects, metadata             |
+| Off-Heap	           |    ~200 MB	| Network buffers, page cache   |
+| Native Memory        |	~100 MB	|  Thread stacks, code cache    |
+| Healthcheck Overhead |	~150 MB	|  Temporary JVM spawn          |
+|  Total Required	   |    ~706 MB |	768M provides buffer        |
+```
+
+### Prevention of Future
+
+- Always set explicit heap limits for JVM appications in containers
+- Container memory limit should be 2-3x heap size to account for off-heap
+- Use lightweight healthchecks (API version> topic list> metadata fetch)
+- Monitor actual memory usage with 'docker stats' before going to production
+- For KRaft, allow 90+ seconds start_period due to metadata initialization
+- Consider disabling healthchecks during development if debugging initialization
+
+### Final Validation: Test-1 Success
+
+After resolving all five issues, the end-to-end pipeline executed successfully.
+
+### Test Execution
+
+#### Terminal 1 (Consumer):
+
+```bash
+[✓] Kafka is ready (attempt 1)
+[GCS-WRITE] gs://streamlake-raw/raw/dataset=orders/
+            ingestion_date=2026-02-19/part-1-5.json
+[COMMIT] topic=streamlake.orders.raw partition=1 offset=5
+```
+
+#### Terminal 2 (Producer):
+
+```bash
+[SUCCESS] Topic=streamlake.orders.raw Partition=1 Offset=5
+```
+
+#### GCS Verification:
+
+```bash
+$ gsutil ls gs://streamlake-raw/raw/dataset=orders/
+              ingestion_date=2026-02-19/
+gs://.../part-1-5.json
+gs://.../part-1-6.json
+```
+
+### Validation Checkpoints Passed
+
+- Consumer connected to Kafka without erros
+- Messages deserialized correctly (key, value, headers)
+- GCS write succeeded with correct path structure
+- Offset committed only after successful GCS write
+- Idempotency validated (reply did not create duplicates)
+
+---
+
+## Lessons Learned
+
+### 1. Container Status ≠ Service Readiness
+
+Docker reporting a container as 'up' only means the process started. For distributed systems like Kafka, true readiness involves metadata initialization, leader election, and network listener binding. Always implement active probing with retry logic in clients.
+
+### 2. KRaft Mode is Not Drop-In Zookeeper Replacement
+
+KRaft introduces new requirements (CLUSTER_ID, controller quorum configuration) and longer boot times, it's architecturally superior for production (eliminates Zookeeper dependency) but requires explicit configuration that wasn't needed in Zookeeper mode.
+
+### 3. Kafka Wire Protocol is Bytes-First
+
+Everything in Kafka (keys, values, headers) is transmitted as raw bytes for protocol efficiency. Client libraries require explicit encoding/decoding. This is intentional design - Kafka is schema-agnostic at the wire level. Never assume string types without explicit .decode() calls.
+
+### 4. Cloud Authenticaiton is Multi-Layered
+
+GCS access requires three things to align: (1) Valid OAuth tokens with correct scopes, (2) Credentials present on the execution machine, (3) IAM permissions on the bucket. Failure at any layer results in 403. Always test from the actual deployment environment, not just your laptop
+
+
