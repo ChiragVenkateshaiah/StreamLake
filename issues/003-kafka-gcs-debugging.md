@@ -357,4 +357,93 @@ Everything in Kafka (keys, values, headers) is transmitted as raw bytes for prot
 
 GCS access requires three things to align: (1) Valid OAuth tokens with correct scopes, (2) Credentials present on the execution machine, (3) IAM permissions on the bucket. Failure at any layer results in 403. Always test from the actual deployment environment, not just your laptop
 
+### 5. JVM Memory is Not Just Heap
+
+Setting -Xmx only controls heap memory. JVM alos allocates off-heap memory for network buffers, native libraries, thread stacks, and code cache. Container memory limits must account for total JVM footprint (~2-3x heap size) plus any external processes like healthchecks.
+
+### 6. Healthchecks Can Kill Services
+
+Poorly chosen healthchecks commands (lik kafka-topics --list) can spawn heavy processes that exceed memory limits or timeout thresholds. Healthchecks should be lightweight (API version checks) and given sufficient grace period during initialization (90s+ for KRaft)
+
+### 7. Debug Incrementally With Exception Visibility
+
+The DLQ pattern silently swallowed exceptions until traceback.print_exc() was added. In development, always log full stack traces. Silent failures hide root causes and waste debugging time. Production can use structured logging, but development needs maximum visibility.
+
+### 8. Resource Constraints Manifest as Mysterious Restarts
+
+OOM kills don't always log obvious errors. The symptoms is often just 'container restarted' with docker ps showing 'Up X seconds' after you expected it to stay running. Always check: (1) docker stats for actual usage, (2) free -h for host memory, (3) docker logs for OOM signatures.
+
+---
+
+## Appendix: Final Working Configuration
+
+### docker-compose.yml
+
+```yml
+version: '3.8'
+
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: streamlake-kafka
+    restart: unless-stopped
+    ports:
+      - '9092:9092'
+    environment:
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29017
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,
+                       CONTROLLER://0.0.0.0:29017
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092
+      KAFKA_HEAP_OPTS: '-Xmx256M -Xms256M'
+    healthcheck:
+      test: kafka-broker-api-versions
+            --bootstrap-server localhost:9092
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+    volumes:
+      - streamlake-kafka-data:/var/lib/kafka/data
+```
+
+### Consumer Retry Logic
+
+```yml
+def _wait_for_kafka(self):
+    for attempt in range(1, KAFKA_READY_RETRIES + 1):
+        try:
+            self.consumer.list_topics(timeout=2)
+            return
+        except KafkaException:
+            time.sleep(KAFKA_READY_DELAY_SEC)
+```
+
+### Headers Deserialization
+
+```yml
+headers = {
+    k: v.decode('utf-8') if isinstance(v, bytes) else v
+    for k, v in (msg.headers() or [])
+```
+
+---
+
+## Conclusion
+
+This 6-hour debugging session revealed that streaming systems fail more often due to misunderstood semantics than missing functionality. Every issue encountered represents a real production failure mode.
+
+- Readiness assumptions break during deploys
+- Configuration requirements change between versions
+- Serialization contracts must be explicit
+- Authentication scopes must match operational requirements
+- Resource constraints manifests as timing bugs
+
+The StreamLake Kafka -> GCS pipeline now runs reliably with proper error handling, retry logic, authentication, and resource allocation. This document serves as a reference for debugging similar distributed systems issues in future data engineering and distributed systems roles.
 
